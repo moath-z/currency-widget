@@ -37,7 +37,6 @@ public class CurrencyWidget extends AppWidgetProvider {
     private static final String ACTION_KEY = "com.moath.currencywidget.KEY";
     private static final String EXTRA_KEY = "key";
     private static final String PREFS = "currency_widget";
-    private static final String RATES_URL = "https://open.er-api.com/v6/latest/EUR";
     private static final long STALE_MS = 6 * 60 * 60 * 1000L; // refresh rates after 6 hours
     private static final int MAX_DIGITS = 12;
 
@@ -168,14 +167,18 @@ public class CurrencyWidget extends AppWidgetProvider {
 
         // Status line
         String status;
-        if (!haveRates) {
-            status = p.getBoolean("rates_error", false) ? "No connection · tap ↻ to retry" : "Loading rates…";
+        if (System.currentTimeMillis() - p.getLong("busy_time", 0) < 30000) {
+            status = "Updating rates…";
+        } else if (!haveRates) {
+            status = p.getBoolean("rates_error", false)
+                    ? "Failed (" + p.getString("rates_error_msg", "?") + ") · tap ↻"
+                    : "Tap ↻ to load rates";
         } else {
             long t = p.getLong("rates_time", 0);
             String when = DateUtils.isToday(t)
                     ? new SimpleDateFormat("HH:mm", Locale.getDefault()).format(new Date(t))
                     : new SimpleDateFormat("d MMM", Locale.getDefault()).format(new Date(t));
-            status = "Rates updated " + when + (p.getBoolean("rates_error", false) ? " · offline" : "");
+            status = "Rates updated " + when + (p.getBoolean("rates_error", false) ? " · update failed (" + p.getString("rates_error_msg", "?") + ")" : "");
         }
         v.setTextViewText(R.id.status, status);
 
@@ -227,42 +230,86 @@ public class CurrencyWidget extends AppWidgetProvider {
         if (!force && age < STALE_MS) return;
 
         final Context app = ctx.getApplicationContext();
+        prefs(app).edit().putLong("busy_time", System.currentTimeMillis()).commit();
+        updateAll(app); // show "Updating rates…" so a tap on ↻ gives feedback
+
         final PendingResult pending = goAsync();
         new Thread(() -> {
+            boolean ok = false;
             try {
                 fetchRates(app);
-                prefs(app).edit().putBoolean("rates_error", false).apply();
-            } catch (Exception e) {
-                prefs(app).edit().putBoolean("rates_error", true).apply();
+                ok = true;
+            } catch (Throwable ignored) {
             } finally {
+                prefs(app).edit().putLong("busy_time", 0).putBoolean("rates_error", !ok).commit();
                 updateAll(app);
                 pending.finish();
             }
         }).start();
     }
 
+    /** Tries each rate source in turn; throws with a short reason if all fail. */
     private static void fetchRates(Context ctx) throws Exception {
-        HttpURLConnection c = (HttpURLConnection) new URL(RATES_URL).openConnection();
+        StringBuilder errors = new StringBuilder();
+        for (int s = 0; s < SOURCES.length; s++) {
+            try {
+                JSONObject json = new JSONObject(download(SOURCES[s]));
+                // Source 0: {"rates":{"SAR":..}}   Sources 1-2: {"eur":{"sar":..}}
+                JSONObject rates = json.has("rates") ? json.getJSONObject("rates") : json.getJSONObject("eur");
+                boolean lower = !json.has("rates");
+
+                SharedPreferences.Editor e = prefs(ctx).edit();
+                for (String code : CURRENCIES) {
+                    String k = lower ? code.toLowerCase(Locale.US) : code;
+                    double r = code.equals("EUR") ? 1.0 : rates.getDouble(k);
+                    e.putString("rate_" + code, Double.toString(r));
+                }
+                e.putLong("rates_time", System.currentTimeMillis());
+                e.putString("rates_error_msg", "");
+                e.commit();
+                return;
+            } catch (Exception ex) {
+                errors.append(s + 1).append(":").append(shortReason(ex)).append(" ");
+            }
+        }
+        prefs(ctx).edit().putString("rates_error_msg", errors.toString().trim()).commit();
+        throw new Exception(errors.toString());
+    }
+
+    private static final String[] SOURCES = {
+            "https://open.er-api.com/v6/latest/EUR",
+            "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/eur.json",
+            "https://latest.currency-api.pages.dev/v1/currencies/eur.json",
+    };
+
+    private static String download(String url) throws Exception {
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
         c.setConnectTimeout(10000);
         c.setReadTimeout(10000);
-        StringBuilder sb = new StringBuilder();
-        try (BufferedReader r = new BufferedReader(new InputStreamReader(c.getInputStream()))) {
-            String line;
-            while ((line = r.readLine()) != null) sb.append(line);
+        c.setRequestProperty("User-Agent", "Mozilla/5.0 (Android) CurrencyWidget/1.1");
+        c.setRequestProperty("Accept", "application/json");
+        try {
+            int code = c.getResponseCode();
+            if (code != 200) throw new Exception("HTTP " + code);
+            StringBuilder sb = new StringBuilder();
+            try (BufferedReader r = new BufferedReader(new InputStreamReader(c.getInputStream(), "UTF-8"))) {
+                String line;
+                while ((line = r.readLine()) != null) sb.append(line);
+            }
+            return sb.toString();
         } finally {
             c.disconnect();
         }
+    }
 
-        JSONObject json = new JSONObject(sb.toString());
-        if (!"success".equals(json.optString("result"))) throw new Exception("bad response");
-        JSONObject rates = json.getJSONObject("rates");
-
-        SharedPreferences.Editor e = prefs(ctx).edit();
-        for (String code : CURRENCIES) {
-            e.putString("rate_" + code, Double.toString(rates.getDouble(code)));
-        }
-        e.putLong("rates_time", System.currentTimeMillis());
-        e.apply();
+    private static String shortReason(Exception e) {
+        String n = e.getClass().getSimpleName();
+        if (n.contains("UnknownHost")) return "no internet/DNS";
+        if (n.contains("Timeout")) return "timeout";
+        if (n.contains("SSL")) return "SSL";
+        if (n.contains("JSON")) return "bad data";
+        String m = e.getMessage();
+        return m != null && m.length() < 20 ? m : n;
     }
 
     private static SharedPreferences prefs(Context ctx) {

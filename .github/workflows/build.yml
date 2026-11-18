@@ -23,6 +23,15 @@ jobs:
         with:
           gradle-version: "8.10.2"
 
+      - name: Check rate sources
+        continue-on-error: true
+        run: |
+          for u in https://open.er-api.com/v6/latest/EUR https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/eur.json https://latest.currency-api.pages.dev/v1/currencies/eur.json; do
+            body=$(curl -s -m 15 -A "Mozilla/5.0 (Android) CurrencyWidget/1.1" "$u" | head -c 4000)
+            sar=$(echo "$body" | python3 -c "import sys,json;d=json.load(sys.stdin);r=d.get('rates') or d.get('eur');print(r.get('SAR') or r.get('sar'), r.get('GBP') or r.get('gbp'))" 2>&1 | tail -1)
+            echo "::notice title=$u::$sar"
+          done
+
       - name: Build
         run: gradle assembleDebug --no-daemon
 
