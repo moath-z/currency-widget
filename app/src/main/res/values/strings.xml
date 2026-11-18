@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Currency Widget</string>
+    <string name="widget_description">Type an amount and convert SAR, GBP and EUR right on your home screen</string>
+</resources>
